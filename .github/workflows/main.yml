@@ -1,0 +1,109 @@
+name: Build FuNPaY
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ১) OTA আপডেট: কোড পুশ করলেই ১-২ মিনিটে সবার অ্যাপে "নতুন আপডেট" পপআপ যাবে, APK লাগবে না
+  ota:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Version stamp
+        run: |
+          VER="1.2.${{ github.run_number }}"
+          echo "VER=$VER" >> $GITHUB_ENV
+          sed -i 's|const APP_VERSION = "[^"]*";|const APP_VERSION = "'"$VER"'";|' www/js/app.js || true
+          sed -i 's|const OTA_URL = "[^"]*";|const OTA_URL = "https://raw.githubusercontent.com/${{ github.repository }}/ota/bundle-$VER.zip";|' www/js/app.js || true
+      - run: npm install
+      - name: Bundle and publish
+        run: |
+          mkdir -p out
+          (cd www && zip -qr ../out/bundle-$VER.zip .)
+          NOTES="$(cat update-notes.txt 2>/dev/null || echo 'নতুন আপডেট')"
+          jq -n --arg v "$VER" --arg u "https://raw.githubusercontent.com/${{ github.repository }}/ota/bundle-$VER.zip" --arg n "$NOTES" '{version:$v,url:$u,notes:$n}' > out/update.json
+          cd out
+          git init -q -b ota
+          git config user.name "ota-bot"
+          git config user.email "ota@users.noreply.github.com"
+          git add .
+          git commit -qm "OTA $VER"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" ota
+
+  # ২) APK: শুধু প্রথমবার ইনস্টলের জন্য (বা নতুন নেটিভ ফিচার যোগ করলে)
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Version stamp
+        run: |
+          VER="1.2.${{ github.run_number }}"
+          sed -i 's|const APP_VERSION = "[^"]*";|const APP_VERSION = "'"$VER"'";|' www/js/app.js || true
+          sed -i 's|const OTA_URL = "[^"]*";|const OTA_URL = "https://raw.githubusercontent.com/${{ github.repository }}/ota/bundle-$VER.zip";|' www/js/app.js || true
+      - run: npm install
+      - run: npx cap add android || true
+      - run: node scripts/fix-android.js || true
+      - name: App icon
+        continue-on-error: true
+        run: npx @capacitor/assets generate --android --iconBackgroundColor "#1d4ed8" --iconBackgroundColorDark "#1d4ed8"
+      - run: npx cap sync android
+      - name: Build APK with SDK 35
+        run: |
+          cd android
+          sed -i 's/gradle-[0-9.]*-all.zip/gradle-8.7-all.zip/g' gradle/wrapper/gradle-wrapper.properties || true
+          chmod +x gradlew
+          sed -i 's/com.android.tools.build:gradle:8.2.1/com.android.tools.build:gradle:8.5.2/g' build.gradle || true
+          sed -i 's/8.2.1/8.5.2/g' build.gradle || true
+          sed -i 's/compileSdkVersion = [0-9]*/compileSdkVersion = 35/g' variables.gradle || true
+          sed -i 's/targetSdkVersion = [0-9]*/targetSdkVersion = 35/g' variables.gradle || true
+
+          # মিসিং mipmap-anydpi-v26 রেফারেন্স নিরাপদভাবে ঠিক করা
+          if [ ! -f "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" ]; then
+            sed -i 's/@mipmap\/ic_launcher_round/@mipmap\/ic_launcher/g' app/src/main/AndroidManifest.xml || true
+          fi
+          if [ ! -f "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" ]; then
+            sed -i 's/@mipmap\/ic_launcher/@drawable\/ic_launcher/g' app/src/main/AndroidManifest.xml || true
+          fi
+          if [ -d "app/src/main/res/mipmap-anydpi-v26" ]; then
+            for f in app/src/main/res/mipmap-anydpi-v26/*.xml; do
+              [ -f "$f" ] || continue
+              if [ ! -f "app/src/main/res/mipmap-anydpi-v26/ic_launcher_foreground.xml" ] && [ ! -f "app/src/main/res/drawable/ic_launcher_foreground.xml" ] && [ ! -f "app/src/main/res/drawable-v24/ic_launcher_foreground.xml" ]; then
+                sed -i 's/@mipmap\/ic_launcher_foreground/@color\/ic_launcher_background/g' "$f" || true
+              fi
+              if [ ! -f "app/src/main/res/mipmap-anydpi-v26/ic_launcher_background.xml" ] && [ ! -f "app/src/main/res/drawable/ic_launcher_background.xml" ] && [ ! -f "app/src/main/res/values/ic_launcher_background.xml" ]; then
+                sed -i 's/@mipmap\/ic_launcher_background/#1d4ed8/g' "$f" || true
+              fi
+            done
+          fi
+
+          ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FuNPaY-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Direct download link
+        run: |
+          mkdir -p apkout
+          cp android/app/build/outputs/apk/debug/app-debug.apk apkout/FuNPaY.apk
+          cd apkout
+          git init -q -b apk
+          git config user.name "apk-bot"
+          git config user.email "apk@users.noreply.github.com"
+          git add .
+          git commit -qm "APK"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" apk
